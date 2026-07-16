@@ -57,6 +57,20 @@ jobs:
           DASHBOARD_FILE: docs/index.html
         run: python monitor.py
 
+       - name: Send test notification
+        run: |
+          python - << 'EOF'
+          import os
+          import requests
+
+          webhook = os.environ["DISCORD_WEBHOOK_URL"]
+          requests.post(webhook, json={
+              "content": "🧪 Test notification from GitHub Actions!"
+          })
+          EOF
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }} 
+
       - name: Save state and dashboard
         run: |
           if git diff --quiet -- state/state.json docs/index.html; then
