@@ -1,4 +1,9 @@
-import asyncio, hashlib, json, os, re
+import asyncio
+import hashlib
+import html as html_lib
+import json
+import os
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,211 +14,524 @@ from zoneinfo import ZoneInfo
 import httpx
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-BRAND_URL = os.getenv("PBANDAI_URL", "https://p-bandai.com/us/brand/onepiececardgame")
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+TIMEZONE_NAME = os.getenv("TIMEZONE", "America/Toronto")
+TZ = ZoneInfo(TIMEZONE_NAME)
+STATE_FILE = Path(os.getenv("STATE_FILE", "state/state.json"))
+DASHBOARD_FILE = Path(os.getenv("DASHBOARD_FILE", "docs/index.html"))
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 DISCORD_MENTION = os.getenv("DISCORD_MENTION", "").strip()
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "").strip()
-TIMEZONE_NAME = os.getenv("TIMEZONE", "America/Toronto")
-STATE_FILE = Path(os.getenv("STATE_FILE", "state/state.json"))
-TZ = ZoneInfo(TIMEZONE_NAME)
+NTFY_URL = os.getenv("NTFY_URL", "https://ntfy.sh").rstrip("/")
+
 REMINDER_MINUTES = (1440, 60, 15, 5)
 
+SOURCES = (
+    {
+        "key": "pbandai_us",
+        "name": "Premium Bandai US — ONE PIECE CARD GAME",
+        "region": "US",
+        "url": "https://p-bandai.com/us/brand/onepiececardgame",
+        "kind": "products",
+    },
+    {
+        "key": "onepiece_news",
+        "name": "Official ONE PIECE CARD GAME News",
+        "region": "Global",
+        "url": "https://en.onepiece-cardgame.com/topics/",
+        "kind": "news",
+    },
+)
+
 @dataclass
-class Product:
-    product_id: str
+class Item:
+    source_key: str
+    source_name: str
+    region: str
+    item_id: str
     title: str
     url: str
     image_url: Optional[str] = None
     preorder_at: Optional[str] = None
     status: str = "unknown"
     button_text: str = ""
+    item_type: str = "product"
 
-def clean(v): return re.sub(r"\s+", " ", v or "").strip()
-def now(): return datetime.now(timezone.utc)
-def pid(url, title=""):
-    m = re.search(r"/item/([A-Za-z0-9_-]+)", url)
-    return m.group(1) if m else hashlib.sha256(f"{url}|{title}".encode()).hexdigest()[:24]
-def load_state():
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def clean(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+def stable_id(url: str, title: str = "") -> str:
+    match = re.search(r"/item/([A-Za-z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    return hashlib.sha256(f"{url}|{title}".encode()).hexdigest()[:24]
+
+def load_state() -> dict:
     if not STATE_FILE.exists():
-        return {"initialized": False, "products": {}, "last_heartbeat_month": None}
+        return {"initialized_sources": [], "items": {}, "last_check": None}
     return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-def save_state(s):
+
+def save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(s, indent=2, sort_keys=True), encoding="utf-8")
-def parse_dt(v):
-    if not v: return None
-    d = datetime.fromisoformat(v)
-    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
-def dtime(d):
-    t = int(d.timestamp())
-    return f"<t:{t}:F> (<t:{t}:R>)"
+    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
-def parse_preorder_time(text):
+def parse_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+def discord_time(dt: datetime) -> str:
+    stamp = int(dt.timestamp())
+    return f"<t:{stamp}:F> (<t:{stamp}:R>)"
+
+def ascii_header(value: str) -> str:
+    value = re.sub(r"[^\x20-\x7E]+", "", value)
+    return value.strip() or "P-Bandai Alert"
+
+async def fetch(url: str, retries: int = 3) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    timeout = httpx.Timeout(40.0)
+    async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=timeout) as client:
+        last_error = None
+        for attempt in range(retries):
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+                return response.text
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < retries:
+                    await asyncio.sleep(2 ** attempt)
+        raise RuntimeError(f"Failed to fetch {url}: {last_error}")
+
+def parse_preorder_time(text: str) -> Optional[datetime]:
     text = clean(text)
-    p = (r"(?:pre[- ]?order|orders?|sales?)\s*"
-         r"(?:start|starts|open|opens|begin|begins|available from)"
-         r"\s*[:\-]?\s*(.{0,130}?(?:AM|PM|am|pm)"
-         r"(?:\s*(?:EDT|EST|ET|PDT|PST|PT|CDT|CST|CT))?)")
-    m = re.search(p, text, re.I)
-    if not m: return None
-    c = clean(m.group(1))
-    offsets = {"EDT":"-0400","EST":"-0500","CDT":"-0500","CST":"-0600","PDT":"-0700","PST":"-0800"}
-    c = re.sub(r"\b(EDT|EST|CDT|CST|PDT|PST)\b", lambda x: offsets[x.group(1).upper()], c, flags=re.I)
-    c = re.sub(r"\b(?:ET|CT|PT)\b", "", c, flags=re.I)
-    try: d = dateparser.parse(c, fuzzy=True)
-    except Exception: return None
-    if not d: return None
-    if d.tzinfo is None: d = d.replace(tzinfo=TZ)
-    return d.astimezone(timezone.utc)
+    patterns = (
+        r"(?:pre[- ]?order|orders?|sales?)\s*"
+        r"(?:start|starts|open|opens|begin|begins|available from)"
+        r"\s*[:\-]?\s*(.{0,140}?(?:AM|PM|am|pm)"
+        r"(?:\s*(?:EDT|EST|ET|PDT|PST|PT|CDT|CST|CT))?)",
+    )
+    candidate = None
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            candidate = clean(match.group(1))
+            break
+    if not candidate:
+        return None
 
-def detect_status(text, button):
-    low = f"{clean(text)} {clean(button)}".lower()
-    if any(x in low for x in ("sold out","out of stock","pre-orders closed","orders closed")): return "sold_out"
-    if any(x in low for x in ("add to cart","pre-order now","preorder now","order now","in stock")): return "available"
-    if any(x in low for x in ("coming soon","pre-order starts","preorder starts","orders start")): return "coming_soon"
+    offsets = {
+        "EDT": "-0400", "EST": "-0500",
+        "CDT": "-0500", "CST": "-0600",
+        "PDT": "-0700", "PST": "-0800",
+    }
+    candidate = re.sub(
+        r"\b(EDT|EST|CDT|CST|PDT|PST)\b",
+        lambda m: offsets[m.group(1).upper()],
+        candidate,
+        flags=re.I,
+    )
+    candidate = re.sub(r"\b(?:ET|CT|PT)\b", "", candidate, flags=re.I)
+
+    try:
+        dt = dateparser.parse(candidate, fuzzy=True)
+    except Exception:
+        return None
+
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    return dt.astimezone(timezone.utc)
+
+def detect_status(text: str, button_text: str = "") -> str:
+    low = f"{clean(text)} {clean(button_text)}".lower()
+    if any(x in low for x in (
+        "sold out", "out of stock", "pre-orders closed",
+        "preorders closed", "orders closed",
+    )):
+        return "sold_out"
+    if any(x in low for x in (
+        "add to cart", "pre-order now", "preorder now",
+        "order now", "in stock",
+    )):
+        return "available"
+    if any(x in low for x in (
+        "coming soon", "pre-order starts",
+        "preorder starts", "orders start",
+    )):
+        return "coming_soon"
     return "unknown"
 
-def extract_products(html):
-    soup = BeautifulSoup(html, "html.parser")
-    found = {}
-    def add(url, title="", image=None):
-        if not url: return
-        url = urljoin(BRAND_URL, url).split("#")[0]
+def extract_product_items(source: dict, page_html: str) -> list[Item]:
+    soup = BeautifulSoup(page_html, "html.parser")
+    items: dict[str, Item] = {}
+
+    def add(url: str, title: str = "", image: Optional[str] = None) -> None:
+        if not url:
+            return
+        url = urljoin(source["url"], url).split("#")[0]
         parsed = urlparse(url)
-        if "p-bandai.com" not in parsed.netloc or "/item/" not in parsed.path: return
+        if "p-bandai.com" not in parsed.netloc or "/item/" not in parsed.path:
+            return
         title = clean(title) or "ONE PIECE CARD GAME product"
-        p = Product(pid(url, title), title[:250], url, urljoin(BRAND_URL, image) if image else None)
-        if p.product_id not in found or len(p.title) > len(found[p.product_id].title): found[p.product_id] = p
-    for a in soup.select('a[href*="/item/"]'):
-        img = a.find("img")
-        image = (img.get("src") or img.get("data-src") or img.get("data-lazy-src")) if img else None
-        alt = img.get("alt", "") if img else ""
-        add(a.get("href",""), clean(a.get_text(" ", strip=True)) or clean(alt), image)
-    for m in re.finditer(r"(?:https?:\\/\\/p-bandai\.com)?\\/us\\/item\\/[A-Za-z0-9_-]+|https?://p-bandai\.com/us/item/[A-Za-z0-9_-]+|/us/item/[A-Za-z0-9_-]+", html):
-        add(m.group(0).replace("\\/","/"))
-    return list(found.values())
+        item_id = stable_id(url, title)
+        candidate = Item(
+            source_key=source["key"],
+            source_name=source["name"],
+            region=source["region"],
+            item_id=item_id,
+            title=title[:250],
+            url=url,
+            image_url=urljoin(source["url"], image) if image else None,
+        )
+        existing = items.get(item_id)
+        if not existing or len(candidate.title) > len(existing.title):
+            items[item_id] = candidate
 
-async def page(browser):
-    return await browser.new_page(viewport={"width":1440,"height":1400}, locale="en-US",
-        timezone_id=TIMEZONE_NAME,
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36")
-async def html(page_obj, url):
-    await page_obj.goto(url, wait_until="domcontentloaded", timeout=90000)
-    try: await page_obj.wait_for_load_state("networkidle", timeout=25000)
-    except PlaywrightTimeoutError: pass
-    await page_obj.wait_for_timeout(3000)
-    return await page_obj.content()
+    for anchor in soup.select('a[href*="/item/"]'):
+        image_el = anchor.find("img")
+        image = None
+        alt = ""
+        if image_el:
+            image = (
+                image_el.get("src")
+                or image_el.get("data-src")
+                or image_el.get("data-lazy-src")
+            )
+            alt = image_el.get("alt", "")
+        card = anchor.find_parent(["article", "li", "div"])
+        card_text = clean(card.get_text(" ", strip=True)) if card else ""
+        title = clean(anchor.get_text(" ", strip=True)) or clean(alt) or card_text[:250]
+        add(anchor.get("href", ""), title, image)
 
-async def enrich(browser, p):
-    pg = await page(browser)
+    for match in re.finditer(
+        r"(?:https?:\\/\\/p-bandai\.com)?\\/us\\/item\\/[A-Za-z0-9_-]+"
+        r"|https?://p-bandai\.com/us/item/[A-Za-z0-9_-]+"
+        r"|/us/item/[A-Za-z0-9_-]+",
+        page_html,
+    ):
+        add(match.group(0).replace("\\/", "/"))
+
+    return list(items.values())
+
+def extract_news_items(source: dict, page_html: str) -> list[Item]:
+    soup = BeautifulSoup(page_html, "html.parser")
+    items: dict[str, Item] = {}
+
+    for anchor in soup.select('a[href*="/topics/"]'):
+        url = urljoin(source["url"], anchor.get("href", "")).split("#")[0]
+        if url.rstrip("/") == source["url"].rstrip("/"):
+            continue
+        title = clean(anchor.get_text(" ", strip=True))
+        image_el = anchor.find("img")
+        if not title and image_el:
+            title = clean(image_el.get("alt", ""))
+        if not title or len(title) < 5:
+            continue
+        item_id = stable_id(url, title)
+        items[item_id] = Item(
+            source_key=source["key"],
+            source_name=source["name"],
+            region=source["region"],
+            item_id=item_id,
+            title=title[:250],
+            url=url,
+            image_url=urljoin(source["url"], image_el.get("src")) if image_el and image_el.get("src") else None,
+            item_type="news",
+        )
+
+    return list(items.values())
+
+async def enrich_product(item: Item) -> Item:
     try:
-        source = await html(pg, p.url)
-        soup = BeautifulSoup(source, "html.parser")
-        text = clean(soup.get_text(" ", strip=True))
-        buttons = [clean(e.get_text(" ", strip=True)) for e in soup.select("button,a.btn,a.button,[role=button],.cart,.purchase,.order,.stock")]
-        p.button_text = " | ".join(dict.fromkeys(x for x in buttons if x and len(x)<=120))[:500]
-        p.status = detect_status(text, p.button_text)
-        opening = parse_preorder_time(text)
-        if opening: p.preorder_at = opening.isoformat()
-        ogt = soup.select_one('meta[property="og:title"]')
-        ogi = soup.select_one('meta[property="og:image"]')
-        if ogt and clean(ogt.get("content","")): p.title = clean(ogt["content"])[:250]
-        if ogi and ogi.get("content"): p.image_url = urljoin(p.url, ogi["content"])
-        return p
-    finally:
-        await pg.close()
+        page_html = await fetch(item.url)
+    except Exception as exc:
+        print(f"Detail page failed for {item.item_id}: {exc}")
+        return item
 
-async def discord(title, desc, p=None, color=0x5865F2):
-    if not WEBHOOK_URL: return
-    embed = {"title":title[:256],"description":desc[:4096],"color":color,"footer":{"text":"P-Bandai Monitor — GitHub Actions"}}
-    if p:
-        embed["url"] = p.url
-        if p.image_url: embed["thumbnail"]={"url":p.image_url}
-    payload = {"username":"P-Bandai Preorder Alerts","content":DISCORD_MENTION or None,
-               "allowed_mentions":{"parse":["roles","users","everyone"] if DISCORD_MENTION else []},
-               "embeds":[embed]}
-    async with httpx.AsyncClient() as c:
-        r = await c.post(WEBHOOK_URL, json=payload, timeout=30); r.raise_for_status()
+    soup = BeautifulSoup(page_html, "html.parser")
+    text = clean(soup.get_text(" ", strip=True))
+    buttons = []
+    for el in soup.select("button,a.btn,a.button,[role=button],.cart,.purchase,.order,.stock"):
+        value = clean(el.get_text(" ", strip=True))
+        if value and len(value) <= 120:
+            buttons.append(value)
 
-async def ntfy(title, desc, p=None):
-    if not NTFY_TOPIC: return
-    safe = re.sub(r"[^\x20-\x7E]+","",title).strip() or "P-Bandai Alert"
-    headers = {"Title":safe,"Priority":"high"}
-    if p: headers["Click"]=p.url
-    async with httpx.AsyncClient() as c:
-        r = await c.post(f"https://ntfy.sh/{NTFY_TOPIC}", content=desc.replace("**","").encode(), headers=headers, timeout=30)
-        r.raise_for_status()
+    item.button_text = " | ".join(dict.fromkeys(buttons))[:500]
+    item.status = detect_status(text, item.button_text)
 
-async def notify(title, desc, p=None, color=0x5865F2):
-    results = await asyncio.gather(discord(title,desc,p,color), ntfy(title,desc,p), return_exceptions=True)
-    for name,res in zip(("Discord","ntfy"),results):
-        if isinstance(res,Exception): print(f"{name} failed: {res}")
+    opening = parse_preorder_time(text)
+    if opening:
+        item.preorder_at = opening.isoformat()
 
-async def run():
+    og_title = soup.select_one('meta[property="og:title"]')
+    og_image = soup.select_one('meta[property="og:image"]')
+    if og_title and clean(og_title.get("content", "")):
+        item.title = clean(og_title["content"])[:250]
+    if og_image and og_image.get("content"):
+        item.image_url = urljoin(item.url, og_image["content"])
+
+    return item
+
+async def discord_send(title: str, description: str, item: Optional[Item] = None, color: int = 0x5865F2):
+    if not DISCORD_WEBHOOK_URL:
+        return
+    embed = {
+        "title": title[:256],
+        "description": description[:4096],
+        "color": color,
+        "footer": {"text": "P-Bandai Monitor — GitHub V4"},
+    }
+    if item:
+        embed["url"] = item.url
+        embed["fields"] = [
+            {"name": "Source", "value": item.source_name, "inline": False},
+            {"name": "Status", "value": item.status, "inline": True},
+        ]
+        if item.image_url:
+            embed["thumbnail"] = {"url": item.image_url}
+
+    payload = {
+        "username": "P-Bandai Preorder Alerts",
+        "content": DISCORD_MENTION or None,
+        "allowed_mentions": {
+            "parse": ["roles", "users", "everyone"] if DISCORD_MENTION else []
+        },
+        "embeds": [embed],
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+        response.raise_for_status()
+
+async def ntfy_send(title: str, description: str, item: Optional[Item] = None, priority: str = "high"):
+    if not NTFY_TOPIC:
+        return
+    headers = {"Title": ascii_header(title), "Priority": priority}
+    if item:
+        headers["Click"] = item.url
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{NTFY_URL}/{NTFY_TOPIC}",
+            content=description.replace("**", "").encode("utf-8"),
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+
+async def notify(title: str, description: str, item: Optional[Item] = None, color: int = 0x5865F2, priority: str = "high"):
+    results = await asyncio.gather(
+        discord_send(title, description, item, color),
+        ntfy_send(title, description, item, priority),
+        return_exceptions=True,
+    )
+    for service, result in zip(("Discord", "ntfy"), results):
+        if isinstance(result, Exception):
+            print(f"{service} notification failed: {result}")
+
+def generate_dashboard(state: dict) -> None:
+    items = list(state.get("items", {}).values())
+    items.sort(key=lambda x: (x.get("preorder_at") is None, x.get("preorder_at") or "", x.get("title", "")))
+
+    rows = []
+    for item in items:
+        rows.append(
+            "<tr>"
+            f"<td>{html_lib.escape(item.get('region', ''))}</td>"
+            f"<td>{html_lib.escape(item.get('item_type', 'product'))}</td>"
+            f"<td><a href=\"{html_lib.escape(item.get('url', ''))}\" target=\"_blank\">"
+            f"{html_lib.escape(item.get('title', 'Untitled'))}</a></td>"
+            f"<td>{html_lib.escape(item.get('status', 'unknown'))}</td>"
+            f"<td>{html_lib.escape(item.get('preorder_at') or 'Not detected')}</td>"
+            f"<td>{html_lib.escape(item.get('last_seen', ''))}</td>"
+            "</tr>"
+        )
+
+    DASHBOARD_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DASHBOARD_FILE.write_text(
+        f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P-Bandai ONE PIECE Monitor</title>
+<style>
+body{{font-family:Arial,sans-serif;max-width:1500px;margin:30px auto;padding:0 18px;background:#101114;color:#eee}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:22px 0}}
+.card{{background:#1b1d22;padding:18px;border-radius:12px}}
+table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #333;text-align:left}}
+th{{background:#1b1d22}}a{{color:#78b7ff}}small{{color:#aaa}}
+</style>
+</head>
+<body>
+<h1>P-Bandai ONE PIECE Monitor</h1>
+<div class="cards">
+<div class="card"><b>Tracked items</b><h2>{len(items)}</h2></div>
+<div class="card"><b>Last check</b><p>{html_lib.escape(state.get('last_check') or 'Not run yet')}</p></div>
+<div class="card"><b>Sources</b><h2>{len(SOURCES)}</h2></div>
+</div>
+<table>
+<tr><th>Region</th><th>Type</th><th>Item</th><th>Status</th><th>Preorder time (UTC)</th><th>Last seen</th></tr>
+{''.join(rows) if rows else '<tr><td colspan="6">No items recorded yet.</td></tr>'}
+</table>
+<p><small>Generated automatically by GitHub Actions.</small></p>
+</body>
+</html>""",
+        encoding="utf-8",
+    )
+
+async def main():
     state = load_state()
-    first = not state.get("initialized",False)
-    saved = state.setdefault("products",{})
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True,args=["--disable-blink-features=AutomationControlled"])
-        pg = await page(browser)
+    initialized = set(state.get("initialized_sources", []))
+    saved_items = state.setdefault("items", {})
+    check_time = now_utc()
+
+    for source in SOURCES:
         try:
-            listing = await html(pg, BRAND_URL)
-            products = extract_products(listing)
-            if not products:
-                await pg.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await pg.wait_for_timeout(3000)
-                products = extract_products(await pg.content())
-            if not products: raise RuntimeError("No P-Bandai product links found")
-            print(f"Found {len(products)} product(s)")
-            for basic in products:
-                try: cur = await enrich(browser,basic)
-                except Exception as e:
-                    print(f"Detail failed {basic.product_id}: {e}"); cur = basic
-                prev = saved.get(cur.product_id)
-                if prev is None:
-                    saved[cur.product_id] = {**asdict(cur),"first_seen":now().isoformat(),"alerts_sent":[]}
-                    if not first:
-                        timing = f"\n\n**Opens:** {dtime(parse_dt(cur.preorder_at))}" if cur.preorder_at else ""
-                        await notify("🆕 New public P-Bandai listing detected",f"**{cur.title}**{timing}\n\n[Open product page]({cur.url})",cur,0x57F287)
+            page_html = await fetch(source["url"])
+            discovered = (
+                extract_product_items(source, page_html)
+                if source["kind"] == "products"
+                else extract_news_items(source, page_html)
+            )
+            if not discovered:
+                raise RuntimeError("No matching items found")
+
+            print(f"{source['key']}: found {len(discovered)} item(s)")
+
+            for base_item in discovered:
+                item = await enrich_product(base_item) if source["kind"] == "products" else base_item
+                key = f"{item.source_key}:{item.item_id}"
+                previous = saved_items.get(key)
+                is_new = previous is None
+
+                if is_new:
+                    saved_items[key] = {
+                        **asdict(item),
+                        "first_seen": check_time.isoformat(),
+                        "last_seen": check_time.isoformat(),
+                        "alerts_sent": [],
+                    }
+                    if source["key"] in initialized:
+                        await notify(
+                            "🆕 New public listing detected" if item.item_type == "product" else "📰 New official ONE PIECE news post",
+                            f"**{item.title}**\n\n[Open item]({item.url})",
+                            item,
+                            0x57F287,
+                            "high",
+                        )
                 else:
-                    old_status = prev.get("status","unknown")
-                    old_time = prev.get("preorder_at")
-                    prev.update({k:v for k,v in asdict(cur).items() if v not in (None,"")})
-                    if not old_time and cur.preorder_at:
-                        await notify("📅 Preorder opening time detected",f"**{cur.title}**\n\n**Opens:** {dtime(parse_dt(cur.preorder_at))}",cur,0x3498DB)
-                    if old_status in {"sold_out","unknown","coming_soon"} and cur.status=="available":
-                        key=f"available:{cur.button_text}"
-                        if key not in prev.setdefault("alerts_sent",[]):
-                            await notify("🔥 Availability/restock detected",f"**{cur.title}** changed from `{old_status}` to **available**.\n\n[Open product page]({cur.url})",cur,0x9B59B6)
-                            prev["alerts_sent"].append(key)
-            current_now = now()
-            for key,item in saved.items():
-                opening = parse_dt(item.get("preorder_at"))
-                if not opening: continue
-                p = Product(key,item.get("title","ONE PIECE product"),item.get("url",BRAND_URL),item.get("image_url"),item.get("preorder_at"),item.get("status","unknown"),item.get("button_text",""))
-                sent = item.setdefault("alerts_sent",[])
-                if opening > current_now:
-                    for mins in REMINDER_MINUTES:
-                        akey=f"reminder:{mins}:{opening.isoformat()}"
-                        if opening-timedelta(minutes=mins) <= current_now < opening and akey not in sent:
-                            label="24 hours" if mins==1440 else "1 hour" if mins==60 else f"{mins} minutes"
-                            await notify(f"⏰ Preorder opens in {label}",f"**{p.title}**\n\n**Opens:** {dtime(opening)}\n\n[Open product page]({p.url})",p,0xED4245 if mins<=15 else 0xFEE75C)
-                            sent.append(akey)
-                live=f"live:{opening.isoformat()}"
-                if opening <= current_now < opening+timedelta(minutes=10) and live not in sent:
-                    await notify("🚨 Preorder should be LIVE now",f"**{p.title}**\n\n[Open product page]({p.url})",p,0xED4245)
-                    sent.append(live)
-            month=datetime.now(TZ).strftime("%Y-%m")
-            if state.get("last_heartbeat_month") != month:
-                state["last_heartbeat_month"]=month
-                await notify("💓 Monthly monitor heartbeat",f"Monitor is running.\n\n**Tracked products:** {len(saved)}",color=0x57F287)
-            state["initialized"]=True
-            state["last_check"]=current_now.isoformat()
-            save_state(state)
-        finally:
-            await pg.close(); await browser.close()
+                    old_status = previous.get("status", "unknown")
+                    old_time = previous.get("preorder_at")
+                    previous.update({
+                        key_name: value
+                        for key_name, value in asdict(item).items()
+                        if value not in (None, "")
+                    })
+                    previous["last_seen"] = check_time.isoformat()
+
+                    if not old_time and item.preorder_at:
+                        await notify(
+                            "📅 Preorder opening time detected",
+                            f"**{item.title}**\n\n**Opens:** {discord_time(parse_iso(item.preorder_at))}",
+                            item,
+                            0x3498DB,
+                            "high",
+                        )
+
+                    if (
+                        item.item_type == "product"
+                        and old_status in {"sold_out", "unknown", "coming_soon"}
+                        and item.status == "available"
+                    ):
+                        alert_key = f"available:{item.button_text}"
+                        sent = previous.setdefault("alerts_sent", [])
+                        if alert_key not in sent:
+                            await notify(
+                                "🔥 Availability/restock detected",
+                                f"**{item.title}** changed from `{old_status}` to **available**.\n\n"
+                                f"[Open product page]({item.url})",
+                                item,
+                                0x9B59B6,
+                                "max",
+                            )
+                            sent.append(alert_key)
+
+            initialized.add(source["key"])
+
+        except Exception as exc:
+            print(f"Source failed: {source['key']}: {exc}")
+
+    for key, saved in saved_items.items():
+        opening = parse_iso(saved.get("preorder_at"))
+        if not opening:
+            continue
+
+        item = Item(
+            source_key=saved.get("source_key", ""),
+            source_name=saved.get("source_name", ""),
+            region=saved.get("region", ""),
+            item_id=saved.get("item_id", key),
+            title=saved.get("title", "ONE PIECE product"),
+            url=saved.get("url", ""),
+            image_url=saved.get("image_url"),
+            preorder_at=saved.get("preorder_at"),
+            status=saved.get("status", "unknown"),
+            button_text=saved.get("button_text", ""),
+            item_type=saved.get("item_type", "product"),
+        )
+        sent = saved.setdefault("alerts_sent", [])
+
+        if opening > check_time:
+            for minutes in REMINDER_MINUTES:
+                alert_key = f"reminder:{minutes}:{opening.isoformat()}"
+                target = opening - timedelta(minutes=minutes)
+                if target <= check_time < opening and alert_key not in sent:
+                    label = (
+                        "24 hours" if minutes == 1440
+                        else "1 hour" if minutes == 60
+                        else f"{minutes} minutes"
+                    )
+                    priority = "max" if minutes <= 15 else "high"
+                    await notify(
+                        f"⏰ Preorder opens in {label}",
+                        f"**{item.title}**\n\n**Opens:** {discord_time(opening)}\n\n"
+                        f"[Open product page]({item.url})",
+                        item,
+                        0xED4245 if minutes <= 15 else 0xFEE75C,
+                        priority,
+                    )
+                    sent.append(alert_key)
+
+        live_key = f"live:{opening.isoformat()}"
+        if opening <= check_time < opening + timedelta(minutes=10) and live_key not in sent:
+            await notify(
+                "🚨 Preorder should be LIVE now",
+                f"**{item.title}**\n\n[Open product page]({item.url})",
+                item,
+                0xED4245,
+                "max",
+            )
+            sent.append(live_key)
+
+    state["initialized_sources"] = sorted(initialized)
+    state["last_check"] = check_time.isoformat()
+    save_state(state)
+    generate_dashboard(state)
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    asyncio.run(main())
