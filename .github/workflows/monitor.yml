@@ -1,4 +1,4 @@
-name: P-Bandai Monitor V4
+name: P-Bandai Monitor V4.1
 
 on:
   workflow_dispatch:
@@ -7,17 +7,16 @@ on:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pbandai-monitor-v4
+  group: pbandai-monitor-v4-1
   cancel-in-progress: false
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -30,8 +29,23 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies
+      - name: Cache Chromium
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Python packages
         run: pip install -r requirements.txt
+
+      - name: Install Chromium
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Install Chromium system dependencies
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
 
       - name: Run monitor
         env:
@@ -49,6 +63,7 @@ jobs:
             echo "No changes to commit."
             exit 0
           fi
+
           git config user.name "pbandai-monitor[bot]"
           git config user.email "pbandai-monitor[bot]@users.noreply.github.com"
           git add state/state.json docs/index.html
